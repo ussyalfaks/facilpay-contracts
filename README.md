@@ -34,18 +34,20 @@ rustup target add wasm32-unknown-unknown
 ### Build All Contracts
 
 ```bash
-
-# build individually
-cd contracts/payment
-stellar contract build
+# From root directory
+make
+```
 
 ### Run Tests
 
 ```bash
+# Test all contracts in workspace
+cargo test --workspace
 
-# Or test individually
-cd contracts/payment
-cargo test
+# Test specific contract
+cargo test -p escrow
+cargo test -p payment
+cargo test -p refund
 ```
 
 ## 📂 Contract Overview
@@ -72,12 +74,12 @@ Processes refund requests:
 - `approve_refund()` - Admin approves
 - `process_refund()` - Execute refund
 
-### Development Workflow
+## 🔄 Development Workflow
 
 1. Fork the repo
 2. Create a feature branch (`git checkout -b feature/amazing-feature`)
 3. Write tests for your changes
-4. Ensure all tests pass (`cargo test`)
+4. Ensure all tests pass (`cargo test --workspace`)
 5. Commit your changes (`git commit -m 'Add amazing feature'`)
 6. Push to your branch (`git push origin feature/amazing-feature`)
 7. Open a Pull Request
