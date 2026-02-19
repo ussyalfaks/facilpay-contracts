@@ -4,11 +4,18 @@ use soroban_sdk::{contract, contracterror, contractevent, contractimpl, contract
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
+    Admin,
     Refund(u64),
     RefundCounter,
     RefundsByStatus(RefundStatus, u64),
     RefundStatusCount(RefundStatus),
     RefundStatusIndex(u64),
+    MerchantRefunds(Address, u64),
+    MerchantRefundCount(Address),
+    CustomerRefunds(Address, u64),
+    CustomerRefundCount(Address),
+    PaymentRefunds(u64, u64),
+    PaymentRefundCount(u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -29,10 +36,10 @@ pub enum Error {
     InvalidPaymentId = 4,
     TransferFailed = 5,
     NotApproved = 6,
-    InvalidStatus = 5,
-    AlreadyProcessed = 6,
-    RefundExceedsPayment = 7,
-    TotalRefundsExceedPayment = 8,
+    InvalidStatus = 7,
+    AlreadyProcessed = 8,
+    RefundExceedsPayment = 9,
+    TotalRefundsExceedPayment = 10,
 }
 
 #[contractevent]
@@ -55,6 +62,10 @@ pub struct RefundProcessed {
     pub amount: i128,
     pub token: Address,
     pub processed_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RefundApproved {
     pub refund_id: u64,
     pub approved_by: Address,
@@ -211,104 +222,7 @@ impl RefundContract {
         Ok(refund_id)
     }
 
-    pub fn approve_refund(env: Env, admin: Address, refund_id: u64) -> Result<(), Error> {
-        // Authenticate admin
-        admin.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::Unauthorized)?; // Or appropriate error if not initialized
-        if admin != stored_admin {
-            return Err(Error::Unauthorized);
-        }
 
-        // Get refund
-        let mut refund: Refund = env
-            .storage()
-            .instance()
-            .get(&DataKey::Refund(refund_id))
-            .ok_or(Error::RefundNotFound)?;
-
-        // Update status
-        refund.status = RefundStatus::Approved;
-
-        // Store updated refund
-        env.storage()
-            .instance()
-            .set(&DataKey::Refund(refund_id), &refund);
-
-        Ok(())
-    }
-
-    pub fn process_refund(env: Env, admin: Address, refund_id: u64) -> Result<(), Error> {
-        // Authenticate admin
-        admin.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::Unauthorized)?;
-        if admin != stored_admin {
-            return Err(Error::Unauthorized);
-        }
-
-        // Get refund
-        let mut refund: Refund = env
-            .storage()
-            .instance()
-            .get(&DataKey::Refund(refund_id))
-            .ok_or(Error::RefundNotFound)?;
-
-        // Validate status
-        if refund.status != RefundStatus::Approved {
-            return Err(Error::NotApproved);
-        }
-
-        // Transfer tokens from merchant to customer
-        // Assuming merchant has approved this contract to spend tokens on their behalf
-        let token_client = token::Client::new(&env, &refund.token);
-
-        // We use transfer_from to move funds from merchant to customer
-        // The merchant must have authorized this contract.
-        // If the merchant revoked auth or lacks funds, this will fail.
-        let transfer_result = token_client.try_transfer_from(
-            &env.current_contract_address(),
-            &refund.merchant,
-            &refund.customer,
-            &refund.amount,
-        );
-
-        match transfer_result {
-            Ok(_) => {
-                // Update status to Processed
-                refund.status = RefundStatus::Processed;
-                let processed_at = env.ledger().timestamp();
-
-                // Store updated refund
-                env.storage()
-                    .instance()
-                    .set(&DataKey::Refund(refund_id), &refund);
-
-                // Emit RefundProcessed event
-                RefundProcessed {
-                    refund_id,
-                    processed_by: admin,
-                    customer: refund.customer,
-                    amount: refund.amount,
-                    token: refund.token,
-                    processed_at,
-                }
-                .publish(&env);
-
-                Ok(())
-            }
-            Err(_) => {
-                // Return TransferFailed error, status remains Approved
-                Err(Error::TransferFailed)
-            }
-        }
-    }
 
     pub fn get_refund(env: &Env, refund_id: u64) -> Result<Refund, Error> {
         // Retrieve refund from storage by ID
