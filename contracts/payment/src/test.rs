@@ -1949,3 +1949,129 @@ fn test_multiple_currencies_in_payments() {
     assert_eq!(p2.currency, Currency::USDC);
     assert_eq!(p3.currency, Currency::BTC);
 }
+
+// Partial Refund Tests
+
+#[test]
+fn test_partial_refund_success() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+    let amount = 1000_i128;
+
+    env.mock_all_auths();
+
+    client.initialize(&admin);
+
+    let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &Currency::USDC, &0, &String::from_str(&env, ""));
+
+    client.partial_refund(&admin, &payment_id, &300);
+
+    let payment = client.get_payment(&payment_id);
+    assert_eq!(payment.status, PaymentStatus::PartialRefunded);
+    assert_eq!(payment.refunded_amount, 300);
+}
+
+#[test]
+fn test_multiple_partial_refunds() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+    let amount = 1000_i128;
+
+    env.mock_all_auths();
+
+    client.initialize(&admin);
+
+    let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &Currency::USDC, &0, &String::from_str(&env, ""));
+
+    client.partial_refund(&admin, &payment_id, &200);
+    client.partial_refund(&admin, &payment_id, &300);
+
+    let payment = client.get_payment(&payment_id);
+    assert_eq!(payment.status, PaymentStatus::PartialRefunded);
+    assert_eq!(payment.refunded_amount, 500);
+}
+
+#[test]
+fn test_partial_refund_becomes_full_refund() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+    let amount = 1000_i128;
+
+    env.mock_all_auths();
+
+    client.initialize(&admin);
+
+    let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &Currency::USDC, &0, &String::from_str(&env, ""));
+
+    client.partial_refund(&admin, &payment_id, &600);
+    client.partial_refund(&admin, &payment_id, &400);
+
+    let payment = client.get_payment(&payment_id);
+    assert_eq!(payment.status, PaymentStatus::Refunded);
+    assert_eq!(payment.refunded_amount, 1000);
+}
+
+#[test]
+fn test_partial_refund_exceeds_payment() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+    let amount = 1000_i128;
+
+    env.mock_all_auths();
+
+    client.initialize(&admin);
+
+    let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &Currency::USDC, &0, &String::from_str(&env, ""));
+
+    let result = client.try_partial_refund(&admin, &payment_id, &1500);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().unwrap(), Error::RefundExceedsPayment);
+}
+
+#[test]
+fn test_partial_refund_cumulative_exceeds_payment() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+    let amount = 1000_i128;
+
+    env.mock_all_auths();
+
+    client.initialize(&admin);
+
+    let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &Currency::USDC, &0, &String::from_str(&env, ""));
+
+    client.partial_refund(&admin, &payment_id, &700);
+    let result = client.try_partial_refund(&admin, &payment_id, &400);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().unwrap(), Error::RefundExceedsPayment);
+}

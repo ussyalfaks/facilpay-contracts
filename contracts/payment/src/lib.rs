@@ -40,6 +40,7 @@ pub enum PaymentStatus {
     Pending,
     Completed,
     Refunded,
+    PartialRefunded,
     Cancelled,
 }
 
@@ -87,11 +88,12 @@ pub enum Error {
     MetadataTooLarge = 9,
     NotesTooLarge = 10,
     InvalidCurrency = 11,
-    SubscriptionNotFound = 12,
-    SubscriptionNotActive = 13,
-    PaymentNotDue = 14,
-    MaxRetriesExceeded = 15,
-    SubscriptionEnded = 16,
+    RefundExceedsPayment = 12,
+    SubscriptionNotFound = 13,
+    SubscriptionNotActive = 14,
+    PaymentNotDue = 15,
+    MaxRetriesExceeded = 16,
+    SubscriptionEnded = 17,
 }
 
 #[contractevent]
@@ -185,6 +187,7 @@ pub struct Payment {
     pub expires_at: u64,
     pub metadata: String,
     pub notes: String,
+    pub refunded_amount: i128,
 }
 
 #[contract]
@@ -252,6 +255,7 @@ impl PaymentContract {
             expires_at,
             metadata,
             notes: String::from_str(&env, ""),
+            refunded_amount: 0,
         };
 
         env.storage()
@@ -415,7 +419,7 @@ impl PaymentContract {
                 payment.status = PaymentStatus::Completed;
             }
             PaymentStatus::Completed => return Err(Error::AlreadyProcessed),
-            PaymentStatus::Refunded => return Err(Error::InvalidStatus),
+            PaymentStatus::Refunded | PaymentStatus::PartialRefunded => return Err(Error::InvalidStatus),
             PaymentStatus::Cancelled => return Err(Error::InvalidStatus),
         }
 
@@ -473,7 +477,7 @@ impl PaymentContract {
             PaymentStatus::Pending => {
                 payment.status = PaymentStatus::Refunded;
             }
-            PaymentStatus::Completed => return Err(Error::InvalidStatus),
+            PaymentStatus::Completed | PaymentStatus::PartialRefunded => return Err(Error::InvalidStatus),
             PaymentStatus::Refunded => return Err(Error::AlreadyProcessed),
             PaymentStatus::Cancelled => return Err(Error::InvalidStatus),
         }
@@ -486,6 +490,63 @@ impl PaymentContract {
             payment_id,
             customer: payment.customer,
             amount: payment.amount,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn partial_refund(
+        env: Env,
+        admin: Address,
+        payment_id: u64,
+        refund_amount: i128,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Contract not initialized");
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        if !env.storage().instance().has(&DataKey::Payment(payment_id)) {
+            return Err(Error::PaymentNotFound);
+        }
+
+        let mut payment = PaymentContract::get_payment(&env, payment_id);
+
+        if PaymentContract::is_payment_expired(&env, payment_id) {
+            return Err(Error::PaymentExpired);
+        }
+
+        match payment.status {
+            PaymentStatus::Pending | PaymentStatus::PartialRefunded => {
+                let new_refunded = payment.refunded_amount + refund_amount;
+                if new_refunded > payment.amount {
+                    return Err(Error::RefundExceedsPayment);
+                }
+                payment.refunded_amount = new_refunded;
+                payment.status = if new_refunded == payment.amount {
+                    PaymentStatus::Refunded
+                } else {
+                    PaymentStatus::PartialRefunded
+                };
+            }
+            _ => return Err(Error::InvalidStatus),
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Payment(payment_id), &payment);
+
+        PaymentRefunded {
+            payment_id,
+            customer: payment.customer,
+            amount: refund_amount,
         }
         .publish(&env);
 
@@ -513,9 +574,7 @@ impl PaymentContract {
             PaymentStatus::Pending => {
                 payment.status = PaymentStatus::Cancelled;
             }
-            PaymentStatus::Completed => return Err(Error::InvalidStatus),
-            PaymentStatus::Refunded => return Err(Error::InvalidStatus),
-            PaymentStatus::Cancelled => return Err(Error::InvalidStatus),
+            PaymentStatus::Completed | PaymentStatus::Refunded | PaymentStatus::PartialRefunded | PaymentStatus::Cancelled => return Err(Error::InvalidStatus),
         }
 
         env.storage()
