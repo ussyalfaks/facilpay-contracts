@@ -101,6 +101,51 @@ fn test_complete_payment_success() {
 }
 
 #[test]
+fn test_complete_payment_event_emission() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let amount = 1000_i128;
+
+    client.initialize(&admin);
+
+    token_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &contract_id, &amount, &1000);
+
+    let payment_id = client.create_payment(&customer, &merchant, &amount, &token_contract_id, &Currency::USDC, &0, &String::from_str(&env, ""));
+
+    client.complete_payment(&admin, &payment_id);
+
+    // Token contract also emits events (transfer_from); count only the payment contract's events
+    let all_events = env.events().all();
+    let mut payment_event_count = 0u32;
+    for i in 0..all_events.len() {
+        let event = all_events.get(i).unwrap();
+        if event.0 == contract_id {
+            payment_event_count += 1;
+        }
+    }
+    assert_eq!(payment_event_count, 1, "PaymentCompleted must be emitted exactly once");
+
+    // PaymentCompleted is the last event emitted by complete_payment
+    let last_event = all_events.last().unwrap();
+    assert_eq!(last_event.0, contract_id);
+}
+
+#[test]
 fn test_refund_payment_success() {
     let env = Env::default();
     let contract_id = env.register(PaymentContract, ());
@@ -124,6 +169,33 @@ fn test_refund_payment_success() {
     // Verify status changed to Refunded
     let payment = client.get_payment(&payment_id);
     assert_eq!(payment.status, PaymentStatus::Refunded);
+}
+
+#[test]
+fn test_refund_payment_event_emission() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+    let amount = 2000_i128;
+
+    env.mock_all_auths();
+
+    client.initialize(&admin);
+
+    let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &Currency::USDC, &0, &String::from_str(&env, ""));
+
+    client.refund_payment(&admin, &payment_id);
+
+    // Verify PaymentRefunded event is emitted exactly once
+    let events = env.events().all();
+    assert_eq!(events.len(), 1, "PaymentRefunded must be emitted exactly once");
+    let event = events.get(0).unwrap();
+    assert_eq!(event.0, contract_id);
 }
 
 #[test]
@@ -484,13 +556,13 @@ fn test_cancel_payment_event_emission() {
 
     let payment_id = client.create_payment(&customer, &merchant, &amount, &token, &Currency::USDC, &0, &String::from_str(&env, ""));
 
-    // Cancel the payment - the event is created as part of the function
-    let result = client.try_cancel_payment(&customer, &payment_id);
-    assert!(result.is_ok());
+    client.cancel_payment(&customer, &payment_id);
 
-    // Verify the payment status changed (which is what the event would indicate)
-    let payment = client.get_payment(&payment_id);
-    assert_eq!(payment.status, PaymentStatus::Cancelled);
+    // Verify PaymentCancelled event is emitted exactly once
+    let events = env.events().all();
+    assert_eq!(events.len(), 1, "PaymentCancelled must be emitted exactly once");
+    let event = events.get(0).unwrap();
+    assert_eq!(event.0, contract_id);
 }
 
 #[test]
