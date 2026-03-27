@@ -16,6 +16,7 @@ pub enum DataKey {
     EscrowEvidenceCount(u64),
     ReputationScore(Address),
     ReputationConfig,
+    VestingSchedule(u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -38,6 +39,10 @@ pub enum Error {
     NotDisputed = 6,
     TimeoutNotReached = 7,
     ReleaseOnHoldPeriod = 8,
+    InvalidVestingSchedule = 9,
+    CliffPeriodNotPassed = 10,
+    MilestoneAlreadyReleased = 11,
+    InsufficientVestedAmount = 12,
 }
 
 #[contractevent]
@@ -106,6 +111,29 @@ pub struct ReputationConfigUpdated {
     pub dispute_initiation_penalty: i64,
 }
 
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VestingScheduleCreated {
+    pub escrow_id: u64,
+    pub total_amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VestedAmountReleased {
+    pub escrow_id: u64,
+    pub amount: i128,
+    pub released_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneReleased {
+    pub escrow_id: u64,
+    pub milestone_index: u32,
+    pub amount: i128,
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub struct ReputationScore {
@@ -150,6 +178,27 @@ pub struct Evidence {
     pub submitter: Address,
     pub ipfs_hash: String,
     pub submitted_at: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct VestingMilestone {
+    pub unlock_timestamp: u64,
+    pub amount: i128,
+    pub released: bool,
+    pub description: String,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct VestingSchedule {
+    pub escrow_id: u64,
+    pub total_amount: i128,
+    pub released_amount: i128,
+    pub start_timestamp: u64,
+    pub cliff_timestamp: u64,
+    pub end_timestamp: u64,
+    pub milestones: Vec<VestingMilestone>,
 }
 
 #[contract]
@@ -770,6 +819,335 @@ impl EscrowContract {
         }
 
         merchant_weight > customer_weight
+    }
+
+    /// Creates a new vesting escrow with milestone-based or time-linear vesting.
+    /// 
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `customer` - The address funding the escrow
+    /// * `merchant` - The address receiving vested funds
+    /// * `amount` - Total amount to be vested (must equal sum of milestone amounts if milestones provided)
+    /// * `token` - The token address for the payment
+    /// * `cliff_timestamp` - Timestamp before which no vesting occurs
+    /// * `end_timestamp` - Timestamp when vesting completes
+    /// * `milestones` - Optional vector of VestingMilestone for milestone-based vesting
+    /// 
+    /// # Returns
+    /// The escrow ID for the created vesting schedule
+    /// 
+    /// # Errors
+    /// * InvalidVestingSchedule - If milestone amounts don't sum to total amount or timestamps are invalid
+    pub fn create_vesting_escrow(
+        env: Env,
+        customer: Address,
+        merchant: Address,
+        amount: i128,
+        token: Address,
+        cliff_timestamp: u64,
+        end_timestamp: u64,
+        milestones: Vec<VestingMilestone>,
+    ) -> Result<u64, Error> {
+        customer.require_auth();
+
+        // Validate timestamps
+        let current_timestamp = env.ledger().timestamp();
+        if cliff_timestamp < current_timestamp {
+            return Err(Error::InvalidVestingSchedule);
+        }
+        if end_timestamp <= cliff_timestamp {
+            return Err(Error::InvalidVestingSchedule);
+        }
+
+        // Validate milestones if provided
+        if !milestones.is_empty() {
+            let mut milestone_total: i128 = 0;
+            for milestone in milestones.iter() {
+                milestone_total = milestone_total.saturating_add(milestone.amount);
+                // Validate milestone unlock timestamp is after cliff
+                if milestone.unlock_timestamp < cliff_timestamp {
+                    return Err(Error::InvalidVestingSchedule);
+                }
+                // Validate milestone unlock timestamp is before or at end
+                if milestone.unlock_timestamp > end_timestamp {
+                    return Err(Error::InvalidVestingSchedule);
+                }
+            }
+            // Milestone amounts must sum to total amount
+            if milestone_total != amount {
+                return Err(Error::InvalidVestingSchedule);
+            }
+        }
+
+        // Create the base escrow
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowCounter)
+            .unwrap_or(0);
+        let escrow_id = counter + 1;
+
+        let escrow = Escrow {
+            id: escrow_id,
+            customer: customer.clone(),
+            merchant: merchant.clone(),
+            amount,
+            token: token.clone(),
+            status: EscrowStatus::Locked,
+            created_at: current_timestamp,
+            release_timestamp: end_timestamp,
+            dispute_started_at: 0,
+            last_activity_at: current_timestamp,
+            escalation_level: 0,
+            min_hold_period: 0,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+        env.storage()
+            .instance()
+            .set(&DataKey::EscrowCounter, &escrow_id);
+
+        // Create and store the vesting schedule
+        let vesting_schedule = VestingSchedule {
+            escrow_id,
+            total_amount: amount,
+            released_amount: 0,
+            start_timestamp: current_timestamp,
+            cliff_timestamp,
+            end_timestamp,
+            milestones,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::VestingSchedule(escrow_id), &vesting_schedule);
+
+        // Index by customer
+        let customer_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CustomerEscrowCount(customer.clone()))
+            .unwrap_or(0);
+        env.storage().instance().set(
+            &DataKey::CustomerEscrows(customer.clone(), customer_count),
+            &escrow_id,
+        );
+        env.storage().instance().set(
+            &DataKey::CustomerEscrowCount(customer.clone()),
+            &(customer_count + 1),
+        );
+
+        // Index by merchant
+        let merchant_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MerchantEscrowCount(merchant.clone()))
+            .unwrap_or(0);
+        env.storage().instance().set(
+            &DataKey::MerchantEscrows(merchant.clone(), merchant_count),
+            &escrow_id,
+        );
+        env.storage().instance().set(
+            &DataKey::MerchantEscrowCount(merchant.clone()),
+            &(merchant_count + 1),
+        );
+
+        VestingScheduleCreated {
+            escrow_id,
+            total_amount: amount,
+        }
+        .publish(&env);
+
+        Ok(escrow_id)
+    }
+
+    /// Returns the vesting schedule for a given escrow ID.
+    /// 
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `escrow_id` - The ID of the escrow
+    /// 
+    /// # Returns
+    /// The VestingSchedule struct
+    /// 
+    /// # Errors
+    /// * EscrowNotFound - If the escrow does not exist or has no vesting schedule
+    pub fn get_vesting_schedule(env: Env, escrow_id: u64) -> Result<VestingSchedule, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::VestingSchedule(escrow_id))
+            .ok_or(Error::EscrowNotFound)
+    }
+
+    /// Calculates the total vested amount that has been unlocked based on the current timestamp.
+    /// Supports both milestone-based and time-linear vesting.
+    /// 
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `escrow_id` - The ID of the escrow
+    /// 
+    /// # Returns
+    /// The total vested amount (including already released amounts)
+    pub fn get_vested_amount(env: Env, escrow_id: u64) -> i128 {
+        let vesting_schedule = match env
+            .storage()
+            .instance()
+            .get::<DataKey, VestingSchedule>(&DataKey::VestingSchedule(escrow_id))
+        {
+            Some(schedule) => schedule,
+            None => return 0,
+        };
+
+        let current_timestamp = env.ledger().timestamp();
+
+        // Before cliff - nothing is vested
+        if current_timestamp < vesting_schedule.cliff_timestamp {
+            return 0;
+        }
+
+        // After end - everything is vested
+        if current_timestamp >= vesting_schedule.end_timestamp {
+            return vesting_schedule.total_amount;
+        }
+
+        // If milestones exist, use milestone-based vesting
+        if !vesting_schedule.milestones.is_empty() {
+            let mut vested_amount: i128 = 0;
+            for milestone in vesting_schedule.milestones.iter() {
+                if current_timestamp >= milestone.unlock_timestamp {
+                    vested_amount = vested_amount.saturating_add(milestone.amount);
+                }
+            }
+            vested_amount
+        } else {
+            // Time-linear vesting (proportional to time elapsed)
+            let total_duration = vesting_schedule
+                .end_timestamp
+                .saturating_sub(vesting_schedule.start_timestamp);
+            let elapsed = current_timestamp.saturating_sub(vesting_schedule.start_timestamp);
+            
+            if total_duration == 0 {
+                return 0;
+            }
+
+            let vested_portion = (elapsed as i128).saturating_mul(vesting_schedule.total_amount);
+            vested_portion / total_duration as i128
+        }
+    }
+
+    /// Calculates the releasable amount (vested but not yet released).
+    /// 
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `escrow_id` - The ID of the escrow
+    /// 
+    /// # Returns
+    /// The amount that can be released
+    pub fn get_releasable_amount(env: Env, escrow_id: u64) -> i128 {
+        let vesting_schedule = match env
+            .storage()
+            .instance()
+            .get::<DataKey, VestingSchedule>(&DataKey::VestingSchedule(escrow_id))
+        {
+            Some(schedule) => schedule,
+            None => return 0,
+        };
+
+        let vested_amount = EscrowContract::get_vested_amount(env, escrow_id);
+        vested_amount.saturating_sub(vesting_schedule.released_amount)
+    }
+
+    /// Releases vested amounts from the escrow. Can be called multiple times to release
+    /// milestone amounts as they unlock or linear vesting portions.
+    /// 
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `admin` - The admin address authorizing the release
+    /// * `escrow_id` - The ID of the escrow
+    /// 
+    /// # Returns
+    /// The amount released
+    /// 
+    /// # Errors
+    /// * EscrowNotFound - If the escrow does not exist
+    /// * CliffPeriodNotPassed - If called before the cliff timestamp
+    /// * InsufficientVestedAmount - If there's no vested amount to release
+    pub fn release_vested_amount(
+        env: Env,
+        admin: Address,
+        escrow_id: u64,
+    ) -> Result<i128, Error> {
+        admin.require_auth();
+
+        // Check if escrow exists
+        if !env.storage().instance().has(&DataKey::Escrow(escrow_id)) {
+            return Err(Error::EscrowNotFound);
+        }
+
+        let mut vesting_schedule = env
+            .storage()
+            .instance()
+            .get::<DataKey, VestingSchedule>(&DataKey::VestingSchedule(escrow_id))
+            .ok_or(Error::EscrowNotFound)?;
+
+        let current_timestamp = env.ledger().timestamp();
+
+        // Enforce cliff period
+        if current_timestamp < vesting_schedule.cliff_timestamp {
+            return Err(Error::CliffPeriodNotPassed);
+        }
+
+        // Calculate vested amount
+        let vested_amount = EscrowContract::get_vested_amount(env.clone(), escrow_id);
+        let releasable_amount = vested_amount.saturating_sub(vesting_schedule.released_amount);
+
+        if releasable_amount == 0 {
+            return Err(Error::InsufficientVestedAmount);
+        }
+
+        // Update the released amount
+        vesting_schedule.released_amount = vesting_schedule
+            .released_amount
+            .saturating_add(releasable_amount);
+
+        // If using milestones, mark released milestones as such
+        if !vesting_schedule.milestones.is_empty() {
+            let mut milestones_vec = vesting_schedule.milestones.clone();
+            for i in 0..milestones_vec.len() {
+                let mut milestone = milestones_vec.get(i).unwrap();
+                if !milestone.released
+                    && current_timestamp >= milestone.unlock_timestamp
+                    && vesting_schedule.released_amount >= milestone.amount
+                {
+                    milestone.released = true;
+                    milestones_vec.set(i, milestone);
+
+                    MilestoneReleased {
+                        escrow_id,
+                        milestone_index: i as u32,
+                        amount: milestone.amount,
+                    }
+                    .publish(&env);
+                }
+            }
+            vesting_schedule.milestones = milestones_vec;
+        }
+
+        // Update storage
+        env.storage()
+            .instance()
+            .set(&DataKey::VestingSchedule(escrow_id), &vesting_schedule);
+
+        VestedAmountReleased {
+            escrow_id,
+            amount: releasable_amount,
+            released_at: current_timestamp,
+        }
+        .publish(&env);
+
+        Ok(releasable_amount)
     }
 }
 

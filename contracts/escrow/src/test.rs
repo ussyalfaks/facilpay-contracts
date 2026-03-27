@@ -1140,3 +1140,675 @@ fn test_release_when_only_release_timestamp_passed() {
 
     client.release_escrow(&admin, &escrow_id, &false);
 }
+
+// ── VESTING SCHEDULE TESTS ───────────────────────────────────────────────────
+
+#[test]
+fn test_create_vesting_escrow_with_milestones() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    // Create milestones that sum to total amount
+    let milestones = vec![
+        &env,
+        VestingMilestone {
+            unlock_timestamp: 2000,
+            amount: 3000,
+            released: false,
+            description: String::from_str(&env, "Milestone 1"),
+        },
+        VestingMilestone {
+            unlock_timestamp: 3000,
+            amount: 4000,
+            released: false,
+            description: String::from_str(&env, "Milestone 2"),
+        },
+        VestingMilestone {
+            unlock_timestamp: 4000,
+            amount: 3000,
+            released: false,
+            description: String::from_str(&env, "Milestone 3"),
+        },
+    ];
+
+    let escrow_id = client
+        .create_vesting_escrow(
+            &customer,
+            &merchant,
+            &10000_i128,
+            &token,
+            &1500_u64,
+            &4000_u64,
+            &milestones,
+        )
+        .unwrap();
+
+    assert_eq!(escrow_id, 1);
+
+    let vesting_schedule = client.get_vesting_schedule(&escrow_id).unwrap();
+    assert_eq!(vesting_schedule.total_amount, 10000);
+    assert_eq!(vesting_schedule.released_amount, 0);
+    assert_eq!(vesting_schedule.cliff_timestamp, 1500);
+    assert_eq!(vesting_schedule.end_timestamp, 4000);
+    assert_eq!(vesting_schedule.milestones.len(), 3);
+}
+
+#[test]
+fn test_create_vesting_escrow_time_linear() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    // Create time-linear vesting (no milestones)
+    let milestones = Vec::new(&env);
+    let escrow_id = client
+        .create_vesting_escrow(
+            &customer,
+            &merchant,
+            &10000_i128,
+            &token,
+            &2000_u64,
+            &10000_u64,
+            &milestones,
+        )
+        .unwrap();
+
+    let vesting_schedule = client.get_vesting_schedule(&escrow_id).unwrap();
+    assert_eq!(vesting_schedule.total_amount, 10000);
+    assert_eq!(vesting_schedule.milestones.len(), 0);
+}
+
+#[test]
+#[should_panic]
+fn test_create_vesting_escrow_invalid_milestone_sum() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    // Milestones sum to 9000, but total amount is 10000 - should fail
+    let milestones = vec![
+        &env,
+        VestingMilestone {
+            unlock_timestamp: 2000,
+            amount: 3000,
+            released: false,
+            description: String::from_str(&env, "Milestone 1"),
+        },
+        VestingMilestone {
+            unlock_timestamp: 3000,
+            amount: 6000,
+            released: false,
+            description: String::from_str(&env, "Milestone 2"),
+        },
+    ];
+
+    client
+        .create_vesting_escrow(
+            &customer,
+            &merchant,
+            &10000_i128,
+            &token,
+            &1500_u64,
+            &4000_u64,
+            &milestones,
+        )
+        .unwrap();
+}
+
+#[test]
+#[should_panic]
+fn test_create_vesting_escrow_cliff_before_current_time() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    // Cliff timestamp is in the past - should fail
+    let milestones = Vec::new(&env);
+    client
+        .create_vesting_escrow(
+            &customer,
+            &merchant,
+            &10000_i128,
+            &token,
+            &500_u64,
+            &4000_u64,
+            &milestones,
+        )
+        .unwrap();
+}
+
+#[test]
+#[should_panic]
+fn test_create_vesting_escrow_end_before_cliff() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    // End timestamp is before cliff - should fail
+    let milestones = Vec::new(&env);
+    client
+        .create_vesting_escrow(
+            &customer,
+            &merchant,
+            &10000_i128,
+            &token,
+            &5000_u64,
+            &4000_u64,
+            &milestones,
+        )
+        .unwrap();
+}
+
+#[test]
+fn test_get_vested_amount_before_cliff() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    let milestones = Vec::new(&env);
+    let escrow_id = client
+        .create_vesting_escrow(
+            &customer,
+            &merchant,
+            &10000_i128,
+            &token,
+            &2000_u64,
+            &10000_u64,
+            &milestones,
+        )
+        .unwrap();
+
+    // Before cliff - should be 0
+    env.ledger().set_timestamp(1500);
+    let vested_amount = client.get_vested_amount(&escrow_id);
+    assert_eq!(vested_amount, 0);
+}
+
+#[test]
+fn test_get_vested_amount_after_cliff_linear() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    let milestones = Vec::new(&env);
+    let escrow_id = client
+        .create_vesting_escrow(
+            &customer,
+            &merchant,
+            &10000_i128,
+            &token,
+            &2000_u64,
+            &10000_u64,
+            &milestones,
+        )
+        .unwrap();
+
+    // At cliff - nothing vested yet in linear model
+    env.ledger().set_timestamp(2000);
+    let vested_amount = client.get_vested_amount(&escrow_id);
+    // Linear vesting starts after cliff
+    assert!(vested_amount > 0);
+
+    // Halfway through vesting period (at timestamp 6000)
+    env.ledger().set_timestamp(6000);
+    let vested_amount = client.get_vested_amount(&escrow_id);
+    assert_eq!(vested_amount, 5000); // Half of 10000
+
+    // After end timestamp - everything vested
+    env.ledger().set_timestamp(11000);
+    let vested_amount = client.get_vested_amount(&escrow_id);
+    assert_eq!(vested_amount, 10000);
+}
+
+#[test]
+fn test_get_vested_amount_milestone_based() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    let milestones = vec![
+        &env,
+        VestingMilestone {
+            unlock_timestamp: 2000,
+            amount: 3000,
+            released: false,
+            description: String::from_str(&env, "Milestone 1"),
+        },
+        VestingMilestone {
+            unlock_timestamp: 3000,
+            amount: 4000,
+            released: false,
+            description: String::from_str(&env, "Milestone 2"),
+        },
+        VestingMilestone {
+            unlock_timestamp: 4000,
+            amount: 3000,
+            released: false,
+            description: String::from_str(&env, "Milestone 3"),
+        },
+    ];
+
+    let escrow_id = client
+        .create_vesting_escrow(
+            &customer,
+            &merchant,
+            &10000_i128,
+            &token,
+            &1500_u64,
+            &4000_u64,
+            &milestones,
+        )
+        .unwrap();
+
+    // Before first milestone
+    env.ledger().set_timestamp(1800);
+    let vested_amount = client.get_vested_amount(&escrow_id);
+    assert_eq!(vested_amount, 0);
+
+    // After first milestone
+    env.ledger().set_timestamp(2500);
+    let vested_amount = client.get_vested_amount(&escrow_id);
+    assert_eq!(vested_amount, 3000);
+
+    // After second milestone
+    env.ledger().set_timestamp(3500);
+    let vested_amount = client.get_vested_amount(&escrow_id);
+    assert_eq!(vested_amount, 7000);
+
+    // After all milestones
+    env.ledger().set_timestamp(4500);
+    let vested_amount = client.get_vested_amount(&escrow_id);
+    assert_eq!(vested_amount, 10000);
+}
+
+#[test]
+fn test_get_releasable_amount() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    let milestones = vec![
+        &env,
+        VestingMilestone {
+            unlock_timestamp: 2000,
+            amount: 3000,
+            released: false,
+            description: String::from_str(&env, "Milestone 1"),
+        },
+        VestingMilestone {
+            unlock_timestamp: 3000,
+            amount: 7000,
+            released: false,
+            description: String::from_str(&env, "Milestone 2"),
+        },
+    ];
+
+    let escrow_id = client
+        .create_vesting_escrow(
+            &customer,
+            &merchant,
+            &10000_i128,
+            &token,
+            &1500_u64,
+            &3000_u64,
+            &milestones,
+        )
+        .unwrap();
+
+    // After first milestone - releasable = vested
+    env.ledger().set_timestamp(2500);
+    let releasable = client.get_releasable_amount(&escrow_id);
+    assert_eq!(releasable, 3000);
+
+    // Release first milestone
+    client.release_vested_amount(&admin, &escrow_id).unwrap();
+
+    // After release - releasable should be 0 until next milestone
+    let releasable = client.get_releasable_amount(&escrow_id);
+    assert_eq!(releasable, 0);
+
+    // After second milestone
+    env.ledger().set_timestamp(3500);
+    let releasable = client.get_releasable_amount(&escrow_id);
+    assert_eq!(releasable, 7000);
+}
+
+#[test]
+fn test_release_vested_amount_milestone() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    let milestones = vec![
+        &env,
+        VestingMilestone {
+            unlock_timestamp: 2000,
+            amount: 3000,
+            released: false,
+            description: String::from_str(&env, "Milestone 1"),
+        },
+        VestingMilestone {
+            unlock_timestamp: 3000,
+            amount: 7000,
+            released: false,
+            description: String::from_str(&env, "Milestone 2"),
+        },
+    ];
+
+    let escrow_id = client
+        .create_vesting_escrow(
+            &customer,
+            &merchant,
+            &10000_i128,
+            &token,
+            &1500_u64,
+            &3000_u64,
+            &milestones,
+        )
+        .unwrap();
+
+    // Try to release before cliff - should fail
+    env.ledger().set_timestamp(1400);
+    let result = client.try_release_vested_amount(&admin, &escrow_id);
+    assert!(result.is_err());
+
+    // After first milestone
+    env.ledger().set_timestamp(2500);
+    let released_amount = client.release_vested_amount(&admin, &escrow_id).unwrap();
+    assert_eq!(released_amount, 3000);
+
+    // Verify vesting schedule updated
+    let vesting_schedule = client.get_vesting_schedule(&escrow_id).unwrap();
+    assert_eq!(vesting_schedule.released_amount, 3000);
+
+    // After second milestone
+    env.ledger().set_timestamp(3500);
+    let released_amount = client.release_vested_amount(&admin, &escrow_id).unwrap();
+    assert_eq!(released_amount, 7000);
+
+    // All released
+    let vesting_schedule = client.get_vesting_schedule(&escrow_id).unwrap();
+    assert_eq!(vesting_schedule.released_amount, 10000);
+}
+
+#[test]
+#[should_panic]
+fn test_release_vested_amount_before_cliff() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    let milestones = Vec::new(&env);
+    let escrow_id = client
+        .create_vesting_escrow(
+            &customer,
+            &merchant,
+            &10000_i128,
+            &token,
+            &2000_u64,
+            &10000_u64,
+            &milestones,
+        )
+        .unwrap();
+
+    // Try to release before cliff
+    env.ledger().set_timestamp(1500);
+    client.release_vested_amount(&admin, &escrow_id).unwrap();
+}
+
+#[test]
+#[should_panic]
+fn test_release_vested_amount_nothing_to_release() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    let milestones = vec![
+        &env,
+        VestingMilestone {
+            unlock_timestamp: 2000,
+            amount: 10000,
+            released: false,
+            description: String::from_str(&env, "Milestone 1"),
+        },
+    ];
+
+    let escrow_id = client
+        .create_vesting_escrow(
+            &customer,
+            &merchant,
+            &10000_i128,
+            &token,
+            &1500_u64,
+            &2000_u64,
+            &milestones,
+        )
+        .unwrap();
+
+    // Before milestone unlocks
+    env.ledger().set_timestamp(1800);
+    client.release_vested_amount(&admin, &escrow_id).unwrap();
+}
+
+#[test]
+fn test_full_vesting_completion() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    let milestones = vec![
+        &env,
+        VestingMilestone {
+            unlock_timestamp: 2000,
+            amount: 2500,
+            released: false,
+            description: String::from_str(&env, "Phase 1"),
+        },
+        VestingMilestone {
+            unlock_timestamp: 3000,
+            amount: 2500,
+            released: false,
+            description: String::from_str(&env, "Phase 2"),
+        },
+        VestingMilestone {
+            unlock_timestamp: 4000,
+            amount: 2500,
+            released: false,
+            description: String::from_str(&env, "Phase 3"),
+        },
+        VestingMilestone {
+            unlock_timestamp: 5000,
+            amount: 2500,
+            released: false,
+            description: String::from_str(&env, "Phase 4"),
+        },
+    ];
+
+    let escrow_id = client
+        .create_vesting_escrow(
+            &customer,
+            &merchant,
+            &10000_i128,
+            &token,
+            &1500_u64,
+            &5000_u64,
+            &milestones,
+        )
+        .unwrap();
+
+    // Release each milestone as it unlocks
+    env.ledger().set_timestamp(2500);
+    let released = client.release_vested_amount(&admin, &escrow_id).unwrap();
+    assert_eq!(released, 2500);
+
+    env.ledger().set_timestamp(3500);
+    let released = client.release_vested_amount(&admin, &escrow_id).unwrap();
+    assert_eq!(released, 2500);
+
+    env.ledger().set_timestamp(4500);
+    let released = client.release_vested_amount(&admin, &escrow_id).unwrap();
+    assert_eq!(released, 2500);
+
+    env.ledger().set_timestamp(5500);
+    let released = client.release_vested_amount(&admin, &escrow_id).unwrap();
+    assert_eq!(released, 2500);
+
+    // Verify all released
+    let vesting_schedule = client.get_vesting_schedule(&escrow_id).unwrap();
+    assert_eq!(vesting_schedule.released_amount, 10000);
+    assert_eq!(vesting_schedule.total_amount, 10000);
+}
+
+#[test]
+fn test_partial_milestone_release() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    let milestones = vec![
+        &env,
+        VestingMilestone {
+            unlock_timestamp: 2000,
+            amount: 5000,
+            released: false,
+            description: String::from_str(&env, "First half"),
+        },
+        VestingMilestone {
+            unlock_timestamp: 3000,
+            amount: 5000,
+            released: false,
+            description: String::from_str(&env, "Second half"),
+        },
+    ];
+
+    let escrow_id = client
+        .create_vesting_escrow(
+            &customer,
+            &merchant,
+            &10000_i128,
+            &token,
+            &1500_u64,
+            &3000_u64,
+            &milestones,
+        )
+        .unwrap();
+
+    // Only first milestone unlocked
+    env.ledger().set_timestamp(2500);
+    let released = client.release_vested_amount(&admin, &escrow_id).unwrap();
+    assert_eq!(released, 5000);
+
+    // Try to release again before second milestone - should fail
+    let result = client.try_release_vested_amount(&admin, &escrow_id);
+    assert!(result.is_err());
+
+    // Second milestone unlocks
+    env.ledger().set_timestamp(3500);
+    let released = client.release_vested_amount(&admin, &escrow_id).unwrap();
+    assert_eq!(released, 5000);
+}
